@@ -1,0 +1,97 @@
+# =============================================================================
+# Container image builds — gitlab.cern.ch
+#
+# Port of .github/workflows/docker.yaml to GitLab CI, modeled on the proven
+# gitlab.cern.ch setup in the sibling chatlas-mcp project (.gitlab-ci.yml):
+# docker:20.10.16 CLI image + docker:20.10.16-dind sidecar on the
+# `docker-privileged-xl` runners, classic `docker build` + `docker push`.
+#
+# Jobs:
+#   build-broker : Containerfile.broker -> $CI_REGISTRY_IMAGE/af-mcp-platform-broker
+#   build-portal : Containerfile.portal -> $CI_REGISTRY_IMAGE/af-mcp-platform-portal
+#
+# $CI_REGISTRY_IMAGE resolves to gitlab-registry.cern.ch/asopio/chatlas-mcp-platform
+# at runtime; nothing below hardcodes it (the sibling chatlas project pulls
+# its images from gitlab-registry.cern.ch).
+#
+# Tag scheme (identical to the GitHub workflow):
+#   <short-sha>         every pipeline
+#   latest              main
+#   <semver> e.g. 0.4.0 v*-tag pipelines (tbump's tag template is v{version})
+#
+# Pushes only on main and v*-tag pipelines; MR pipelines build (verify)
+# without pushing. Deployment stays on the Helm chart / Flux side — the
+# values overlay is simply:
+#
+#   image:
+#     registry: gitlab-registry.cern.ch/asopio/chatlas-mcp-platform
+#     broker:
+#       repository: af-mcp-platform-broker   # tag: "" -> chart appVersion
+#     portal:
+#       repository: af-mcp-platform-portal
+#   imagePullSecrets:
+#     - name: gitlab-registry-pull  # project access token, read_registry scope
+# =============================================================================
+
+default:
+  image: "docker:20.10.16"
+  services:
+  - docker:20.10.16-dind
+  tags:
+  - docker-privileged-xl
+
+stages:
+  - build-docker-image
+
+variables:
+  # TLS cert dir for the dind sidecar — required for `docker login`/`push`
+  # to reach the dind daemon (same as the chatlas-mcp setup).
+  DOCKER_TLS_CERTDIR: "/certs"
+
+# Runs before every job. The docker:20.10.16 image is alpine-based and has
+# no git binary; git is needed for the `git describe` versioning below
+# (same pattern as chatlas-mcp's before_script).
+before_script:
+  - apk update
+  - apk add git
+  # Branch/MR pipelines only fetch the pipeline's own ref; fetch all tags
+  # so `git describe` can resolve a real version (not just a SHA) on main.
+  - git fetch --tags --force
+  - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+
+.build-image:
+  stage: build-docker-image
+  script:
+    # Same version derivation as the GitHub workflow: git describe against
+    # tbump's v*-tags, falling back to the commit SHA when no tag is
+    # reachable (hatch-vcs then uses the broker's fallback_version).
+    - VERSION="$(git describe --tags --always | sed 's/^v//')"
+    - TAGS="$CI_REGISTRY_IMAGE/$IMAGE_NAME:$CI_COMMIT_SHORT_SHA"
+    - if [ "$CI_COMMIT_BRANCH" = "main" ]; then TAGS="$TAGS $CI_REGISTRY_IMAGE/$IMAGE_NAME:latest"; fi
+    - if [ -n "$CI_COMMIT_TAG" ]; then TAGS="$TAGS $CI_REGISTRY_IMAGE/$IMAGE_NAME:$VERSION"; fi
+    - T=""; for t in $TAGS; do T="$T -t $t"; done
+    - docker build --pull $T -f "$CONTAINERFILE" --build-arg "${BUILD_ARG_NAME}=${VERSION}" .
+    - if [ "$CI_COMMIT_BRANCH" = "main" ] || [ -n "$CI_COMMIT_TAG" ]; then for t in $TAGS; do docker push "$t"; done; fi
+  after_script:
+    - docker logout "$CI_REGISTRY" || true
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+build-broker:
+  extends: .build-image
+  variables:
+    IMAGE_NAME: af-mcp-platform-broker
+    CONTAINERFILE: Containerfile.broker
+    # Baked into the broker's _version.py (setuptools-scm/hatch-vcs; the
+    # pixi builder stage has no git binary — see Containerfile.broker).
+    BUILD_ARG_NAME: SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AF_MCP_BROKER
+
+build-portal:
+  extends: .build-image
+  variables:
+    IMAGE_NAME: af-mcp-platform-portal
+    CONTAINERFILE: Containerfile.portal
+    # Inlined into the Astro client bundle at build time (shown in the UI).
+    BUILD_ARG_NAME: PUBLIC_APP_VERSION
